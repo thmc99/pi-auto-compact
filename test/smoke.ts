@@ -340,10 +340,10 @@ test("threshold hot-reloads from disk between prompts", async () => {
 	await pi.fireInput({ text: "hi" }, above92.ctx);
 	assert.equal(above92.compacts.length, 0, "90% < 92%");
 
-	writeConfig({ threshold: 25 }); // below MIN_THRESHOLD: reject, keep 92
+	writeConfig({ threshold: 15 }); // below MIN_THRESHOLD: reject, keep 92
 	const tampered = makeCtx({ usage: { tokens: 90, contextWindow: 100 } });
 	await pi.fireInput({ text: "hi" }, tampered.ctx);
-	assert.equal(tampered.compacts.length, 0, "tampered 25% must not take effect");
+	assert.equal(tampered.compacts.length, 0, "tampered 15% must not take effect");
 });
 
 test("/compact-threshold persists atomically, merges keys, validates input", async () => {
@@ -364,7 +364,7 @@ test("/compact-threshold persists atomically, merges keys, validates input", asy
 		"unknown config keys survive a save",
 	);
 
-	for (const bad of ["0", "20", "abc", "99", "100", "-5"]) {
+	for (const bad of ["0", "19", "abc", "99", "100", "-5"]) {
 		const before = readFileSync(CONFIG_FILE, "utf8");
 		await cmd.handler(bad, h.ctx);
 		assert.equal(h.notifies.at(-1)!.kind, "warning", bad);

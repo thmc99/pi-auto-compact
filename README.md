@@ -26,7 +26,7 @@ The default threshold is **78% used**. Change it inside Pi with:
 /compact-threshold 50
 ```
 
-Values are 30–98; 99 is rejected because compaction itself needs headroom. This saves the setting atomically (merging into the existing file, so other keys survive). Show the current value:
+Values are 20–98; 99 is rejected because compaction itself needs headroom. This saves the setting atomically (merging into the existing file, so other keys survive). Show the current value:
 
 ```text
 /compact-threshold
