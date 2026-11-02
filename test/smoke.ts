@@ -559,6 +559,60 @@ test("a reserve the user changed stops being managed", async () => {
 	}
 });
 
+test("ownership is judged from the file, not pi's stale in-memory settings", async () => {
+	writeConfig({
+		threshold: 78,
+		alignPiThreshold: true,
+		alignedReserveTokens: { "deepseek/deepseek-flash": 220_000 },
+	});
+	writePiSettings({
+		compaction: { modelOverrides: { "deepseek/deepseek-flash": { reserveTokens: 220_000 } } },
+	});
+	try {
+		const mock = makePi();
+		// Pi's in-memory snapshot predates our last write and still shows an old value.
+		mock.pi.getSettings = () => ({
+			compaction: { modelOverrides: { "deepseek/deepseek-flash": { reserveTokens: 999_999 } } },
+		});
+		const pi = install(mock);
+		const h = makeCtx({ usage: undefined });
+		await pi.command("compact-threshold").handler("350k", h.ctx);
+		assert.equal(
+			readPiSettings().compaction.modelOverrides["deepseek/deepseek-flash"].reserveTokens,
+			650_000,
+			"the managed reserve is rewritten to 1M - 350k",
+		);
+		assert.equal(
+			JSON.parse(readFileSync(CONFIG_FILE, "utf8")).alignedReserveTokens["deepseek/deepseek-flash"],
+			650_000,
+		);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
+test("a global reserve written since the last reload still blocks align on", async () => {
+	writeConfig({ threshold: 78, alignPiThreshold: false });
+	writePiSettings({ compaction: { reserveTokens: 400_000 } });
+	try {
+		const mock = makePi();
+		// Pi's snapshot predates the user's global reserve.
+		mock.pi.getSettings = () => ({ compaction: {} });
+		const pi = install(mock);
+		const h = makeCtx({ usage: undefined });
+		await pi.command("compact-threshold").handler("align on", h.ctx);
+		assert.equal(h.notifies.at(-1)!.kind, "warning");
+		assert.ok(
+			!readPiSettings().compaction.modelOverrides,
+			"no per-model override is written over the user's global reserve",
+		);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
+	}
+});
+
 test("reset clears the threshold and the managed reserve", async () => {
 	writeConfig({
 		threshold: 40,

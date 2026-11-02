@@ -101,6 +101,18 @@ function loadConfig(fallback: PluginConfig): PluginConfig {
 	}
 }
 
+/** Read a JSON object file from disk; a missing, corrupt or non-object file reads as {}. */
+function readJsonObject(file: string): Record<string, unknown> {
+	try {
+		const raw = JSON.parse(readFileSync(file, "utf8"));
+		if (raw && typeof raw === "object" && !Array.isArray(raw))
+			return raw as Record<string, unknown>;
+	} catch {
+		// Missing or corrupt: treat as empty.
+	}
+	return {};
+}
+
 /**
  * Read-modify-write a JSON object file through a temp file and a rename, so a
  * crash can never leave it half-written. Keys this extension does not know
@@ -111,14 +123,7 @@ function updateJsonFile(
 	update: (current: Record<string, unknown>) => Record<string, unknown>,
 ): void {
 	mkdirSync(dirname(file), { recursive: true });
-	let current: Record<string, unknown> = {};
-	try {
-		const raw = JSON.parse(readFileSync(file, "utf8"));
-		if (raw && typeof raw === "object" && !Array.isArray(raw))
-			current = raw as Record<string, unknown>;
-	} catch {
-		// Start from an empty object when the file is missing or corrupt.
-	}
+	const current = readJsonObject(file);
 	const tempFile = `${file}.${process.pid}.${Date.now()}.tmp`;
 	writeFileSync(
 		tempFile,
@@ -277,6 +282,24 @@ function readPiCompaction(pi: ExtensionAPI): PiCompaction {
 	}
 }
 
+/**
+ * The compaction reserves as they are on disk. Ownership decisions must read
+ * this, not pi.getSettings(): Pi's settings snapshot only refreshes on /reload,
+ * so right after we write settings.json it still shows the value from before.
+ */
+function readOnDiskReserves(key: string): { global?: number; model?: number } {
+	const compaction = (readJsonObject(SETTINGS_FILE).compaction ?? {}) as {
+		reserveTokens?: unknown;
+		modelOverrides?: Record<string, { reserveTokens?: unknown } | undefined>;
+	};
+	const asNumber = (value: unknown): number | undefined =>
+		typeof value === "number" ? value : undefined;
+	return {
+		global: asNumber(compaction.reserveTokens),
+		model: asNumber(compaction.modelOverrides?.[key]?.reserveTokens),
+	};
+}
+
 /** Pi resolves the reserve per model override, then the global value, then its built-in default. */
 function piReserveTokens(compaction: PiCompaction, key: string): number {
 	return (
@@ -386,13 +409,13 @@ export default function (pi: ExtensionAPI) {
 		const key = modelKey(model);
 		const contextWindow = model?.contextWindow ?? 0;
 		if (!key || contextWindow <= 0) return "unchanged";
-		const compaction = readPiCompaction(pi);
-		const current = compaction?.modelOverrides?.[key]?.reserveTokens;
+		const onDisk = readOnDiskReserves(key);
+		const current = onDisk.model;
 		const managed = config.alignedReserveTokens[key];
 		if (
 			current === undefined &&
 			managed === undefined &&
-			compaction?.reserveTokens !== undefined
+			onDisk.global !== undefined
 		) {
 			// The user set a compaction budget of their own; a per-model entry would silently beat it.
 			return "owned-by-user";
@@ -460,7 +483,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		notifySafe(
 			ctx,
-			`Pi compaction aligned to ${thresholdLabel(config)} for ${modelKey(model)} — run /reload to apply.`,
+			`Pi compaction aligned to ${thresholdLabel(config)} — run /reload to apply.`,
 			"info",
 		);
 	};
@@ -560,7 +583,7 @@ export default function (pi: ExtensionAPI) {
 						const result = syncPiThreshold(ctx.model);
 						ctx.ui.notify(
 							result === "aligned"
-								? `Mid-run compaction now follows ${thresholdLabel(config)} for ${modelKey(ctx.model) ?? "the current model"} — run /reload to apply`
+								? `Mid-run compaction now follows ${thresholdLabel(config)} — run /reload to apply`
 								: result === "owned-by-user"
 									? "Pi already has a compaction budget for this model; leaving it alone"
 									: "Mid-run compaction follows the threshold (nothing to write)",
