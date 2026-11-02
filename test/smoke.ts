@@ -189,7 +189,8 @@ test("projected over threshold: compact once, then send", async () => {
 	assert.equal(res.action, "continue");
 	assert.equal(h.compacts.length, 1);
 	assert.match(h.statuses[0]!, /projected/);
-	assert.equal(h.statuses.at(-1), undefined, "status cleared after success");
+	assert.ok(!/projected/.test(h.statuses.at(-1)!), "the compacting status is replaced after success");
+	assert.match(h.statuses.at(-1)!, /^compact at 78/);
 });
 
 test("image prompts project image cost into usage (text alone stays below)", async () => {
@@ -313,7 +314,7 @@ test("turn_end status reflects the threshold and clears below it", async () => {
 		assert.match(hot.statuses.at(-1)!, /compact before next prompt/);
 		const cool = makeCtx({ usage: { tokens: 10, contextWindow: 100 } });
 		pi.fireTurnEnd(cool.ctx);
-		assert.equal(cool.statuses.at(-1), undefined);
+		assert.equal(cool.statuses.at(-1), "compact at 50 · 20.0% used");
 	} finally {
 		writeConfig({ threshold: 78 });
 	}
@@ -364,7 +365,7 @@ test("/compact-threshold persists atomically, merges keys, validates input", asy
 		"unknown config keys survive a save",
 	);
 
-	for (const bad of ["0", "19", "abc", "99", "100", "-5"]) {
+	for (const bad of ["0", "19", "abc", "99", "100", "-5", "49k", "49999", "0.04m", "1e5", "k"]) {
 		const before = readFileSync(CONFIG_FILE, "utf8");
 		await cmd.handler(bad, h.ctx);
 		assert.equal(h.notifies.at(-1)!.kind, "warning", bad);
@@ -381,11 +382,11 @@ test("/compact-threshold persists atomically, merges keys, validates input", asy
 
 // --- mid-run (tool_call) check ------------------------------------------------
 
-test("tool_call below threshold stays silent and never compacts", () => {
+test("tool_call below threshold shows the plain status and never compacts", () => {
 	const pi = install(makePi());
 	const h = makeCtx({ usage: { tokens: 10, contextWindow: 100 } });
 	pi.fireToolCall(h.ctx);
-	assert.equal(h.statuses.at(-1), undefined);
+	assert.equal(h.statuses.at(-1), "compact at 78 · 12.8% used");
 	assert.equal(h.compacts.length, 0, "a tool call must never trigger ctx.compact()");
 });
 
@@ -394,7 +395,7 @@ test("tool_call above threshold reports pi's own mid-run trigger", () => {
 	// 80% usage on a 1M window; pi's default reserve leaves a ~98% trigger.
 	const h = makeCtx({ usage: { tokens: 800_000, contextWindow: 1_000_000 } });
 	pi.fireToolCall(h.ctx);
-	assert.match(h.statuses.at(-1)!, /context 80% . pi compacts at 98% between tool batches/);
+	assert.match(h.statuses.at(-1)!, /context 800k . pi compacts at 984k between tool batches/);
 	assert.equal(h.compacts.length, 0, "ctx.compact() aborts the run; never called here");
 });
 
@@ -402,7 +403,7 @@ test("tool_call past pi's trigger reports a compaction after this batch", () => 
 	const pi = install(makePi());
 	const h = makeCtx({ usage: { tokens: 990_000, contextWindow: 1_000_000 } });
 	pi.fireToolCall(h.ctx, "read");
-	assert.match(h.statuses.at(-1)!, /context 99% . compacting after this tool batch/);
+	assert.match(h.statuses.at(-1)!, /context 990k . compacting after this tool batch/);
 	assert.equal(h.compacts.length, 0);
 	// Repeated identical checks must not re-write the status line.
 	const before = h.statuses.length;
@@ -417,7 +418,7 @@ test("tool_call without a model falls back to a generic pressure line", () => {
 		model: undefined,
 	});
 	pi.fireToolCall(h.ctx);
-	assert.match(h.statuses.at(-1)!, /context 90% . pi compacts at \?%/);
+	assert.match(h.statuses.at(-1)!, /context 90 . pi compacts at \? between tool batches/);
 });
 
 // --- pi threshold alignment ----------------------------------------------------
@@ -442,7 +443,7 @@ test("align on writes a per-model reserve so pi compacts mid-run at our threshol
 		// pi now compacts at contextWindow - reserveTokens = 78%.
 		const ctx = makeCtx({ usage: { tokens: 800_000, contextWindow: 1_000_000 } });
 		pi.fireToolCall(ctx.ctx);
-		assert.match(ctx.statuses.at(-1)!, /context 80% . compacting after this tool batch/);
+		assert.match(ctx.statuses.at(-1)!, /context 800k . compacting after this tool batch/);
 	} finally {
 		writeConfig({ threshold: 78 });
 		rmSync(SETTINGS_FILE, { force: true });
@@ -613,5 +614,157 @@ test("/compact-threshold without arguments reports both thresholds", async () =>
 		assert.match(h.notifies.at(-1)!.text, /Usage: \/compact-threshold align on\|off/);
 	} finally {
 		writeConfig({ threshold: 78 });
+	}
+});
+
+// --- absolute token thresholds --------------------------------------------------
+
+test("/compact-threshold accepts token counts and switches between units", async () => {
+	writeConfig({ threshold: 78 });
+	rmSync(SETTINGS_FILE, { force: true });
+	try {
+		const pi = install(makePi());
+		const cmd = pi.command("compact-threshold");
+		const h = makeCtx({ usage: undefined });
+		const saved = () => JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+
+		for (const [input, tokens] of [
+			["200000", 200_000],
+			["200k", 200_000],
+			["200,000", 200_000],
+			["0.2m", 200_000],
+			["50k", 50_000],
+			["1.5M", 1_500_000],
+		] as const) {
+			await cmd.handler(input, h.ctx);
+			assert.equal(saved().thresholdTokens, tokens, input);
+		}
+		assert.equal(saved().threshold, 78, "the percent value is left alone");
+
+		await cmd.handler("200k", h.ctx);
+		assert.match(h.notifies.at(-1)!.text, /set to 200k tokens \(20% of the 1M window\)/);
+
+		await cmd.handler("62", h.ctx);
+		assert.equal(saved().threshold, 62);
+		assert.ok(!("thresholdTokens" in saved()), "setting a percent clears the token threshold");
+
+		await cmd.handler("200k", h.ctx);
+		await cmd.handler("45%", h.ctx);
+		assert.equal(saved().threshold, 45, "an explicit % is a percent");
+		assert.ok(!("thresholdTokens" in saved()));
+	} finally {
+		writeConfig({ threshold: 78 });
+	}
+});
+
+test("token threshold drives the preflight, independent of the window size", async () => {
+	writeConfig({ threshold: 78, thresholdTokens: 200_000 });
+	try {
+		const pi = install(makePi());
+		const calm = makeCtx({ usage: { tokens: 150_000, contextWindow: 1_000_000 } });
+		await pi.fireInput({ text: "hi" }, calm.ctx);
+		assert.equal(calm.compacts.length, 0, "150k < 200k");
+
+		const hot = makeCtx({
+			usage: { tokens: 199_999, contextWindow: 1_000_000 },
+			onCompact: (c) => c.onComplete?.({}),
+		});
+		await pi.fireInput({ text: "hi" }, hot.ctx);
+		assert.equal(hot.compacts.length, 1, "199,999 + the prompt crosses 200k");
+		assert.match(hot.statuses[0]!, /projected 200k\/200k . compacting before send/);
+	} finally {
+		writeConfig({ threshold: 78 });
+	}
+});
+
+test("a token threshold above the window is capped below it", async () => {
+	writeConfig({ threshold: 78, thresholdTokens: 500_000 });
+	try {
+		const pi = install(makePi());
+		const below = makeCtx({ usage: { tokens: 90_000, contextWindow: 100_000 } });
+		await pi.fireInput({ text: "hi" }, below.ctx);
+		assert.equal(below.compacts.length, 0, "cap is 98% of the window = 98k");
+
+		const above = makeCtx({
+			usage: { tokens: 99_000, contextWindow: 100_000 },
+			onCompact: (c) => c.onComplete?.({}),
+		});
+		await pi.fireInput({ text: "hi" }, above.ctx);
+		assert.equal(above.compacts.length, 1);
+
+		const cmd = pi.command("compact-threshold");
+		const h = makeCtx({ usage: { tokens: 1, contextWindow: 100_000 } });
+		await cmd.handler("", h.ctx);
+		assert.match(h.notifies.at(-1)!.text, /500k tokens, capped to 98k \(98% of the 100k window\)/);
+	} finally {
+		writeConfig({ threshold: 78 });
+	}
+});
+
+test("an invalid token threshold on disk falls back to the last valid one", async () => {
+	writeConfig({ threshold: 78, thresholdTokens: 200_000 });
+	try {
+		const pi = install(makePi());
+		writeConfig({ threshold: 78, thresholdTokens: 10_000 }); // below the 50k minimum
+		const h = makeCtx({ usage: { tokens: 199_999, contextWindow: 1_000_000 }, onCompact: (c) => c.onComplete?.({}) });
+		await pi.fireInput({ text: "hi" }, h.ctx);
+		assert.equal(h.compacts.length, 1, "still 200k, not the tampered 10k");
+
+		writeConfig({ threshold: 78 }); // key removed: percent mode again
+		const percentMode = makeCtx({ usage: { tokens: 199_999, contextWindow: 1_000_000 } });
+		await pi.fireInput({ text: "hi" }, percentMode.ctx);
+		assert.equal(percentMode.compacts.length, 0, "199,999 < 78% of 1M");
+	} finally {
+		writeConfig({ threshold: 78 });
+	}
+});
+
+test("status shows the token threshold and how much of it is used", () => {
+	writeConfig({ threshold: 78, thresholdTokens: 200_000 });
+	try {
+		const pi = install(makePi());
+		const half = makeCtx({ usage: { tokens: 100_000, contextWindow: 1_000_000 } });
+		pi.fireTurnEnd(half.ctx);
+		assert.equal(half.statuses.at(-1), "compact at 200k \u00b7 50.0% used");
+
+		const over = makeCtx({ usage: { tokens: 250_000, contextWindow: 1_000_000 } });
+		pi.fireTurnEnd(over.ctx);
+		assert.equal(over.statuses.at(-1), "compact at 200k \u00b7 125.0% used \u00b7 compact before next prompt");
+
+		const unknown = makeCtx({ usage: { tokens: null, contextWindow: 1_000_000 } });
+		pi.fireTurnEnd(unknown.ctx);
+		assert.equal(unknown.statuses.at(-1), "compact at 200k", "tokens are unknown right after compaction");
+
+		const noModel = makeCtx({ usage: undefined, model: undefined });
+		pi.fireSessionStart(noModel.ctx);
+		assert.equal(noModel.statuses.at(-1), "compact at 200k");
+	} finally {
+		writeConfig({ threshold: 78 });
+	}
+});
+
+test("alignment writes the reserve that leaves exactly the token threshold", async () => {
+	writeConfig({ threshold: 78, thresholdTokens: 200_000 });
+	rmSync(SETTINGS_FILE, { force: true });
+	try {
+		const pi = install(makePi());
+		const h = makeCtx({ usage: undefined });
+		await pi.command("compact-threshold").handler("align on", h.ctx);
+		assert.match(h.notifies.at(-1)!.text, /follows 200k/);
+		assert.equal(
+			readPiSettings().compaction.modelOverrides["deepseek/deepseek-flash"].reserveTokens,
+			800_000,
+			"1M window - 200k threshold",
+		);
+
+		// Changing the threshold re-aligns the entry this extension owns.
+		await pi.command("compact-threshold").handler("300k", h.ctx);
+		assert.equal(
+			readPiSettings().compaction.modelOverrides["deepseek/deepseek-flash"].reserveTokens,
+			700_000,
+		);
+	} finally {
+		writeConfig({ threshold: 78 });
+		rmSync(SETTINGS_FILE, { force: true });
 	}
 });
