@@ -34,7 +34,7 @@ You can also enter an absolute **token count** instead of a percentage:
 /compact-threshold 200000    # also: 200k, 200,000, 0.2m
 ```
 
-A bare number of 100 or more is read as tokens, and a `k` or `m` suffix always means tokens (minimum 50k). `62` or `62%` is a percentage. Setting one unit clears the other. The token threshold is the same on every model, but is capped at 98% of a model's window if that model is smaller than the threshold. Show the current value:
+A `k` or `m` suffix always means tokens, and a bare number of 100 or more is also read as tokens. Token counts must be at least 50k, so a bare `100` to `49999` is rejected; write `100k` if you mean 100,000. `62` or `62%` is a percentage, from 20 up to but not including 99 (decimals such as `62.5` work). A bare `99` is rejected too. Setting one unit clears the other. The token threshold is the same on every model, but is capped at 98% of a model's window if that model is smaller than the threshold. Show the current value:
 
 ```text
 /compact-threshold
@@ -62,6 +62,8 @@ Two things make the configured threshold visible during a run:
 /reload                         # let pi re-read its settings
 /compact-threshold align off    # back to pi's own threshold
 ```
+
+While alignment is on, the extension writes one entry per model, the first time you select that model (for example with `/model`) and again whenever the threshold changes. The reserve is `contextWindow - threshold`, so it differs per model, and the extension only learns a model's window when you select it. Expect `settings.json` to gain an entry for each model you switch to. A new entry only takes effect after `/reload`, and the extension says so when it writes one. Switching back to a model that is already aligned writes nothing. `align off` or `reset` removes every entry the extension wrote; entries you set yourself are left alone. If you don't want `settings.json` touched on model switches, leave alignment off. The preflight check still works without it.
 
 A larger reserve also raises the token cap Pi gives the summary itself (`0.8 × reserveTokens`, still bounded by the model's max output tokens), so summaries may get longer.
 
