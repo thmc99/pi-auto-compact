@@ -2,7 +2,7 @@
 
 Pi extension: before sending a prompt, check context usage against the threshold (a percentage of the model's window, or an absolute token count). If it is over the threshold, run `ctx.compact()` first, then send. During a run, `tool_call` only reports context pressure; mid-run compaction is left to Pi.
 
-This is a personal fork of `Chasen-Liao/pi-auto-compact` (remote `upstream`). It is not published to npm and is not intended to be merged back. The functional changes from upstream are the minimum percent threshold (20 instead of 30), an absolute token threshold (`/compact-threshold 200k`), and a persistent status item showing the threshold in tokens.
+This is a fork of `Chasen-Liao/pi-auto-compact` (remote `upstream`). The repo is public on GitHub (`thmc99/pi-auto-compact`) and installs from there, but it is a personal project: it is not published to npm, not supported for other users, and not intended to be merged back. The functional changes from upstream are the minimum percent threshold (20 instead of 30), an absolute token threshold (`/compact-threshold 200k`), and a persistent status item showing the threshold in tokens.
 
 The only source file is `extensions/auto-compact.ts`. There is no build step. Peer dependency: `@earendil-works/pi-coding-agent >=0.99.0` (Node `>=22.19.0`). Types are checked against 1.0.2; the end-to-end baseline is still 0.99.1.
 

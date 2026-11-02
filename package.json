@@ -10,14 +10,17 @@
     "compaction"
   ],
   "license": "MIT",
-  "author": "Chasen Liao",
+  "author": "Thomas McCausland",
+  "contributors": [
+    "Chasen Liao (original author)"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Chasen-Liao/pi-auto-compact.git"
+    "url": "git+https://github.com/thmc99/pi-auto-compact.git"
   },
-  "homepage": "https://github.com/Chasen-Liao/pi-auto-compact#readme",
+  "homepage": "https://github.com/thmc99/pi-auto-compact#readme",
   "bugs": {
-    "url": "https://github.com/Chasen-Liao/pi-auto-compact/issues"
+    "url": "https://github.com/thmc99/pi-auto-compact/issues"
   },
   "files": [
     "extensions",

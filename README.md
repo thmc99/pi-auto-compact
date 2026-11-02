@@ -8,15 +8,13 @@ Requires `@earendil-works/pi-coding-agent >= 0.99.0` on Node 22.19+ (verified ag
 
 ## Install
 
-```bash
-pi install npm:pi-auto-compact
-```
-
-Or install directly from GitHub:
+This is a fork of [Chasen-Liao/pi-auto-compact](https://github.com/Chasen-Liao/pi-auto-compact) and is not published to npm. Install it from GitHub:
 
 ```bash
-pi install git:github.com/Chasen-Liao/pi-auto-compact
+pi install git:github.com/thmc99/pi-auto-compact
 ```
+
+If you also have the upstream package (`npm:pi-auto-compact`) installed, remove it, so the two don't both load.
 
 ## Configuration
 
