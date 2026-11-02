@@ -25,6 +25,13 @@ const DEFAULT_THRESHOLD = 78;
  */
 const MIN_THRESHOLD = 20;
 const MAX_THRESHOLD = 99;
+/**
+ * Lower bound for an absolute token threshold. Same reasoning as MIN_THRESHOLD:
+ * Pi keeps ~20k recent tokens, so anything close to that just loops "Nothing
+ * to compact". There is no static upper bound (windows differ per model);
+ * resolveThresholdTokens caps it below the window at runtime.
+ */
+const MIN_THRESHOLD_TOKENS = 50_000;
 const STATUS_KEY = "pi-auto-compact";
 const CONFIG_FILE = join(getAgentDir(), "pi-auto-compact.json");
 /** Pi's own settings file. Alignment writes one compaction budget per model into it. */
@@ -35,6 +42,8 @@ const SOFT_COMPACT_ERRORS = ["Nothing to compact", "Already compacted"];
 interface PluginConfig {
 	/** Compact before sending a prompt once the projected context reaches this percent. */
 	threshold: number;
+	/** Absolute token threshold. When set it wins over `threshold`. */
+	thresholdTokens?: number;
 	/** Also aim Pi's own compaction threshold (the mid-run check between tool batches) at `threshold`. */
 	alignPiThreshold: boolean;
 	/** reserveTokens this extension wrote, keyed by `provider/model`, so `align off` can undo exactly those. */
@@ -51,8 +60,17 @@ function defaultConfig(): PluginConfig {
 
 function parseConfig(raw: unknown, fallback: PluginConfig): PluginConfig {
 	const source = (raw ?? {}) as Partial<PluginConfig>;
-	const { threshold, alignedReserveTokens } = source;
+	const { threshold, thresholdTokens, alignedReserveTokens } = source;
 	return {
+		// Key absent: percent mode. Key present but invalid: keep the last valid value.
+		thresholdTokens:
+			thresholdTokens === undefined
+				? undefined
+				: typeof thresholdTokens === "number" &&
+						Number.isFinite(thresholdTokens) &&
+						thresholdTokens >= MIN_THRESHOLD_TOKENS
+					? Math.round(thresholdTokens)
+					: fallback.thresholdTokens,
 		threshold:
 			typeof threshold === "number" &&
 			Number.isFinite(threshold) &&
@@ -153,6 +171,83 @@ function getValidUsage(
 	return { tokens: usage.tokens, contextWindow: usage.contextWindow };
 }
 
+/** Compact token count for display: 800, 12.5k, 200k, 1M. */
+function formatTokens(count: number): string {
+	const trim = (text: string): string => text.replace(/\.0$/, "");
+	if (count < 1000) return String(Math.round(count));
+	if (count < 1_000_000) {
+		const k = count / 1000;
+		return `${k >= 100 ? Math.round(k) : trim(k.toFixed(1))}k`;
+	}
+	return `${trim((count / 1_000_000).toFixed(1))}M`;
+}
+
+/** The effective threshold in tokens for a model with this context window. */
+function resolveThresholdTokens(
+	config: PluginConfig,
+	contextWindow: number,
+): number {
+	if (config.thresholdTokens !== undefined) {
+		// Stay below the window, mirroring the exclusive MAX_THRESHOLD in percent mode.
+		const cap = Math.floor(contextWindow * ((MAX_THRESHOLD - 1) / 100));
+		return Math.min(config.thresholdTokens, cap);
+	}
+	return Math.round(contextWindow * (config.threshold / 100));
+}
+
+/** Short label for the configured threshold: "78%" or "200k". */
+function thresholdLabel(config: PluginConfig): string {
+	return config.thresholdTokens !== undefined
+		? formatTokens(config.thresholdTokens)
+		: `${config.threshold}%`;
+}
+
+/** Longer description, with the other unit filled in when the context window is known. */
+function describeThreshold(config: PluginConfig, contextWindow: number): string {
+	if (config.thresholdTokens !== undefined) {
+		const base = `${formatTokens(config.thresholdTokens)} tokens`;
+		if (contextWindow <= 0) return base;
+		const effective = resolveThresholdTokens(config, contextWindow);
+		const percent = Math.round((effective / contextWindow) * 100);
+		return effective < config.thresholdTokens
+			? `${base}, capped to ${formatTokens(effective)} (${percent}% of the ${formatTokens(contextWindow)} window)`
+			: `${base} (${percent}% of the ${formatTokens(contextWindow)} window)`;
+	}
+	return contextWindow > 0
+		? `${config.threshold}% (${formatTokens(resolveThresholdTokens(config, contextWindow))} tokens)`
+		: `${config.threshold}%`;
+}
+
+type ThresholdInput =
+	| { kind: "percent"; value: number }
+	| { kind: "tokens"; value: number };
+
+/**
+ * Parse /compact-threshold input. "62", "62%" → percent (MIN..MAX_THRESHOLD);
+ * "200000", "200k", "0.2m" → tokens (>= MIN_THRESHOLD_TOKENS). A bare number
+ * of 100 or more is a token count; 99-100 is rejected as ambiguous.
+ */
+function parseThresholdInput(raw: string): ThresholdInput | undefined {
+	const match = /^(\d+(?:\.\d+)?)(%|k|m)?$/.exec(raw.trim().toLowerCase().replace(/,/g, ""));
+	if (!match) return undefined;
+	const amount = Number(match[1]);
+	const unit = match[2];
+	const percent = (): ThresholdInput | undefined =>
+		amount >= MIN_THRESHOLD && amount < MAX_THRESHOLD
+			? { kind: "percent", value: amount }
+			: undefined;
+	const tokens = (multiplier: number): ThresholdInput | undefined => {
+		const value = Math.round(amount * multiplier);
+		return value >= MIN_THRESHOLD_TOKENS ? { kind: "tokens", value } : undefined;
+	};
+	if (unit === "%") return percent();
+	if (unit === "k") return tokens(1000);
+	if (unit === "m") return tokens(1_000_000);
+	return amount >= 100 ? tokens(1) : percent();
+}
+
+const THRESHOLD_USAGE = `Usage: /compact-threshold [${MIN_THRESHOLD}-${MAX_THRESHOLD - 1} (percent) | ${formatTokens(MIN_THRESHOLD_TOKENS)}+ (tokens, e.g. 200k)] | align on|off | reset`;
+
 /** Fire-and-forget notify that survives a stale ctx. */
 function notifySafe(
 	ctx: ExtensionContext,
@@ -191,6 +286,15 @@ function piReserveTokens(compaction: PiCompaction, key: string): number {
 	);
 }
 
+/** Token count at which Pi's own threshold checks start compacting. */
+function piTriggerTokens(
+	compaction: PiCompaction,
+	key: string,
+	contextWindow: number,
+): number {
+	return contextWindow - piReserveTokens(compaction, key);
+}
+
 /** Percent of the context window at which Pi's own threshold checks start compacting. */
 function piTriggerPercent(
 	compaction: PiCompaction,
@@ -224,6 +328,35 @@ export default function (pi: ExtensionAPI) {
 		setStatus(ctx, text, kind);
 	};
 
+	/**
+	 * The persistent status item: where the threshold sits and how much of it is
+	 * used. Over the threshold it turns into a warning. Pi's own footer already
+	 * shows the model's full window, so only the threshold is spelled out here.
+	 */
+	const refreshStatus = (
+		ctx: ExtensionContext,
+		model: ExtensionContext["model"] = ctx.model,
+	): void => {
+		const raw = ctx.getContextUsage();
+		const contextWindow =
+			raw && raw.contextWindow > 0 ? raw.contextWindow : (model?.contextWindow ?? 0);
+		if (contextWindow <= 0) {
+			setStatusOnce(ctx, `compact at ${thresholdLabel(config)}`);
+			return;
+		}
+		const threshold = resolveThresholdTokens(config, contextWindow);
+		const label = `compact at ${formatTokens(threshold)}`;
+		const tokens = raw?.tokens;
+		if (tokens == null) {
+			setStatusOnce(ctx, label);
+			return;
+		}
+		const used = `${label} · ${((tokens / threshold) * 100).toFixed(1)}% used`;
+		if (tokens >= threshold)
+			setStatusOnce(ctx, `${used} · compact before next prompt`, "warning");
+		else setStatusOnce(ctx, used);
+	};
+
 	const modelKey = (model: ExtensionContext["model"]): string | undefined =>
 		model ? `${model.provider}/${model.id}` : undefined;
 
@@ -239,7 +372,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Point Pi's own compaction threshold at the configured percentage for one
+	 * Point Pi's own compaction threshold at the configured threshold for one
 	 * model, by writing a `compaction.modelOverrides` reserve: Pi compacts
 	 * whenever projected tokens exceed `contextWindow - reserveTokens`, and that
 	 * check also runs between tool batches, so aligning it is what makes a
@@ -271,7 +404,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const reserveTokens = Math.max(
 			0,
-			Math.round(contextWindow * (1 - config.threshold / 100)),
+			contextWindow - resolveThresholdTokens(config, contextWindow),
 		);
 		if (current === reserveTokens) return "unchanged";
 		updateJsonFile(SETTINGS_FILE, (file) => {
@@ -327,7 +460,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		notifySafe(
 			ctx,
-			`Pi compaction aligned to ${config.threshold}% for ${modelKey(model)} — run /reload to apply.`,
+			`Pi compaction aligned to ${thresholdLabel(config)} for ${modelKey(model)} — run /reload to apply.`,
 			"info",
 		);
 	};
@@ -364,12 +497,13 @@ export default function (pi: ExtensionAPI) {
 			try {
 				ctx.compact({
 					onComplete: () => {
-						if (gen === sessionGeneration) setStatusOnce(ctx, undefined);
+						if (gen === sessionGeneration) refreshStatus(ctx);
 						resolve(null);
 					},
 					onError: (error) => {
-						if (gen === sessionGeneration && !isSoftCompactionError(error)) {
-							setStatusOnce(ctx, "compact failed", "error");
+						if (gen === sessionGeneration) {
+							if (isSoftCompactionError(error)) refreshStatus(ctx);
+							else setStatusOnce(ctx, "compact failed", "error");
 						}
 						resolve(error);
 					},
@@ -384,6 +518,7 @@ export default function (pi: ExtensionAPI) {
 		lastStatus = undefined;
 		setStatus(ctx, undefined);
 		refreshAlignment(ctx);
+		refreshStatus(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -392,10 +527,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("model_select", (event, ctx) => {
 		refreshAlignment(ctx, event.model);
+		refreshStatus(ctx, event.model);
 	});
 
 	pi.registerCommand("compact-threshold", {
-		description: `Show or set the auto-compaction threshold (usage: /compact-threshold [${MIN_THRESHOLD}-${MAX_THRESHOLD - 1}] | align on|off | reset)`,
+		description: `Show or set the auto-compaction threshold, as a percent or a token count (${THRESHOLD_USAGE.replace(/^Usage: /, "")})`,
 		handler: async (args, ctx) => {
 			// Hot reload first: the value may have changed in another session.
 			config = loadConfig(config);
@@ -424,7 +560,7 @@ export default function (pi: ExtensionAPI) {
 						const result = syncPiThreshold(ctx.model);
 						ctx.ui.notify(
 							result === "aligned"
-								? `Mid-run compaction now follows ${config.threshold}% for ${modelKey(ctx.model) ?? "the current model"} — run /reload to apply`
+								? `Mid-run compaction now follows ${thresholdLabel(config)} for ${modelKey(ctx.model) ?? "the current model"} — run /reload to apply`
 								: result === "owned-by-user"
 									? "Pi already has a compaction budget for this model; leaving it alone"
 									: "Mid-run compaction follows the threshold (nothing to write)",
@@ -440,13 +576,15 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!head) {
+				const contextWindow =
+					ctx.getContextUsage()?.contextWindow || ctx.model?.contextWindow || 0;
 				const lines = [
-					`Auto-compaction threshold: ${config.threshold}%`,
+					`Auto-compaction threshold: ${describeThreshold(config, contextWindow)}`,
 					describePiTrigger(ctx) ?? "Pi compaction: model context window unknown",
 				];
 				if (!config.alignPiThreshold)
 					lines.push(
-						`Run /compact-threshold align on to compact mid-run at ${config.threshold}% too`,
+						`Run /compact-threshold align on to compact mid-run at ${thresholdLabel(config)} too`,
 					);
 				ctx.ui.notify(lines.join("\n"), "info");
 				return;
@@ -462,6 +600,7 @@ export default function (pi: ExtensionAPI) {
 						`Auto-compaction threshold reset to ${config.threshold}%`,
 						"info",
 					);
+					refreshStatus(ctx);
 				} catch {
 					ctx.ui.notify(
 						"Could not reset auto-compaction threshold",
@@ -471,33 +610,34 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const value = Number(head.replace(/%$/, ""));
-			if (
-				!Number.isFinite(value) ||
-				value < MIN_THRESHOLD ||
-				value >= MAX_THRESHOLD
-			) {
-				ctx.ui.notify(
-					`Usage: /compact-threshold [${MIN_THRESHOLD}-${MAX_THRESHOLD - 1}] | align on|off | reset`,
-					"warning",
-				);
+			const parsed = parseThresholdInput(head);
+			if (!parsed) {
+				ctx.ui.notify(THRESHOLD_USAGE, "warning");
 				return;
 			}
 
 			try {
 				// Persist first, then update memory, so a failed save never desyncs the two.
-				writeConfig({ threshold: value });
-				config = loadConfig({ ...config, threshold: value });
+				// Setting one unit clears the other: only one threshold is ever active.
+				const patch: Partial<PluginConfig> =
+					parsed.kind === "percent"
+						? { threshold: parsed.value, thresholdTokens: undefined }
+						: { thresholdTokens: parsed.value };
+				writeConfig(patch);
+				config = loadConfig({ ...config, ...patch });
 				lastStatus = undefined;
 			} catch {
 				ctx.ui.notify("Could not save auto-compaction threshold", "error");
 				return;
 			}
+			const contextWindow =
+				ctx.getContextUsage()?.contextWindow || ctx.model?.contextWindow || 0;
 			ctx.ui.notify(
-				`Auto-compaction threshold set to ${config.threshold}%`,
+				`Auto-compaction threshold set to ${describeThreshold(config, contextWindow)}`,
 				"info",
 			);
 			refreshAlignment(ctx);
+			refreshStatus(ctx);
 		},
 	});
 
@@ -505,18 +645,7 @@ export default function (pi: ExtensionAPI) {
 	// prompt will trigger a preflight compaction. No compaction happens here.
 	pi.on("turn_end", (_event, ctx) => {
 		config = loadConfig(config);
-		const usage = getValidUsage(ctx);
-		if (!usage) {
-			setStatusOnce(ctx, undefined);
-			return;
-		}
-		const percent = (usage.tokens / usage.contextWindow) * 100;
-		if (percent >= config.threshold) {
-			// Pi's own status bar already shows usage/window; only add the actionable hint.
-			setStatusOnce(ctx, "compact before next prompt", "warning");
-		} else {
-			setStatusOnce(ctx, undefined);
-		}
+		refreshStatus(ctx);
 	});
 
 	// Mid-run check: context grows with every tool result, and Pi only compacts
@@ -527,20 +656,20 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", (_event, ctx) => {
 		const usage = getValidUsage(ctx);
 		if (!usage) return;
-		const percent = (usage.tokens / usage.contextWindow) * 100;
-		if (percent < config.threshold) {
-			setStatusOnce(ctx, undefined);
+		if (usage.tokens < resolveThresholdTokens(config, usage.contextWindow)) {
+			refreshStatus(ctx);
 			return;
 		}
 		const key = modelKey(ctx.model);
 		const trigger = key
-			? piTriggerPercent(readPiCompaction(pi), key, usage.contextWindow)
+			? piTriggerTokens(readPiCompaction(pi), key, usage.contextWindow)
 			: undefined;
+		const context = formatTokens(usage.tokens);
 		setStatusOnce(
 			ctx,
-			trigger !== undefined && percent >= trigger
-				? `context ${percent.toFixed(0)}% · compacting after this tool batch`
-				: `context ${percent.toFixed(0)}% · pi compacts at ${trigger?.toFixed(0) ?? "?"}% between tool batches`,
+			trigger !== undefined && usage.tokens >= trigger
+				? `context ${context} · compacting after this tool batch`
+				: `context ${context} · pi compacts at ${trigger !== undefined ? formatTokens(trigger) : "?"} between tool batches`,
 			"warning",
 		);
 	});
@@ -566,14 +695,13 @@ export default function (pi: ExtensionAPI) {
 		const projected =
 			usage.tokens +
 			estimateTokens({ role: "user", content, timestamp: Date.now() });
-		if (projected < usage.contextWindow * (config.threshold / 100))
-			return { action: "continue" };
+		const threshold = resolveThresholdTokens(config, usage.contextWindow);
+		if (projected < threshold) return { action: "continue" };
 
 		const gen = sessionGeneration;
-		const projectedPercent = ((projected / usage.contextWindow) * 100).toFixed(1);
 		setStatusOnce(
 			ctx,
-			`projected ${projectedPercent}% · compacting before send`,
+			`projected ${formatTokens(projected)}/${formatTokens(threshold)} · compacting before send`,
 			"warning",
 		);
 
