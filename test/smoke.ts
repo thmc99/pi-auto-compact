@@ -773,6 +773,32 @@ test("an invalid token threshold on disk falls back to the last valid one", asyn
 	}
 });
 
+test("status text uses the footer's dim colour, and warning/error keep theirs", async () => {
+	writeConfig({ threshold: 50 });
+	try {
+		const pi = install(makePi());
+		const themed = (usage: { tokens: number | null; contextWindow: number }) => {
+			const h = makeCtx({ usage });
+			h.ctx.ui.theme = { fg: (kind: string, text: string) => `<${kind}>${text}</${kind}>` };
+			return h;
+		};
+		const cool = themed({ tokens: 100, contextWindow: 1000 });
+		pi.fireTurnEnd(cool.ctx);
+		assert.match(cool.statuses.at(-1)!, /^<dim>compact at 500 .*<\/dim>$/);
+
+		const hot = themed({ tokens: 900, contextWindow: 1000 });
+		pi.fireTurnEnd(hot.ctx);
+		assert.match(hot.statuses.at(-1)!, /^<warning>.*compact before next prompt<\/warning>$/);
+
+		const failing = themed({ tokens: 900, contextWindow: 1000 });
+		failing.ctx.compact = (handlers: CompactHandler) => handlers.onError?.(new Error("boom"));
+		await pi.fireInput({ text: "hi" }, failing.ctx);
+		assert.equal(failing.statuses.at(-1), "<error>compact failed</error>");
+	} finally {
+		writeConfig({ threshold: 78 });
+	}
+});
+
 test("status shows the token threshold and how much of it is used", () => {
 	writeConfig({ threshold: 78, thresholdTokens: 200_000 });
 	try {

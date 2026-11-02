@@ -159,7 +159,7 @@ function setStatus(
 		else
 			ctx.ui.setStatus(
 				STATUS_KEY,
-				kind === "info" ? text : ctx.ui.theme.fg(kind, text),
+				ctx.ui.theme.fg(kind === "info" ? "dim" : kind, text),
 			);
 	} catch {
 		// The ctx may be stale after a session switch/reload; never break the prompt flow over status updates.
